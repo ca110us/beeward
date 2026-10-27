@@ -9,19 +9,19 @@ func TestExtractCgroupPath(t *testing.T) {
 		want    string
 	}{
 		{
-			name: "cgroup v2 - burstable pod",
+			name:    "cgroup v2 - burstable pod",
 			content: `0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice/cri-containerd-abc123.scope`,
-			want: "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
+			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
 		},
 		{
-			name: "cgroup v2 - guaranteed pod (no QoS layer)",
+			name:    "cgroup v2 - guaranteed pod (no QoS layer)",
 			content: `0::/kubepods.slice/kubepods-pod6910effd_ea14_4f76_a7de_53c333338acb.slice/cri-containerd-xyz789.scope`,
-			want: "/sys/fs/cgroup/kubepods.slice/kubepods-pod6910effd_ea14_4f76_a7de_53c333338acb.slice",
+			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-pod6910effd_ea14_4f76_a7de_53c333338acb.slice",
 		},
 		{
-			name: "cgroup v2 - besteffort pod",
+			name:    "cgroup v2 - besteffort pod",
 			content: `0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod7589d90f_83af_4a05_a4ee_8bb078db72b8.slice/cri-containerd-def456.scope`,
-			want: "/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod7589d90f_83af_4a05_a4ee_8bb078db72b8.slice",
+			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod7589d90f_83af_4a05_a4ee_8bb078db72b8.slice",
 		},
 		{
 			name: "cgroup v1 - multiple lines (cpu controller)",
@@ -58,9 +58,9 @@ func TestExtractCgroupPath(t *testing.T) {
 			want:    "",
 		},
 		{
-			name: "cgroup v2 - without container scope",
+			name:    "cgroup v2 - without container scope",
 			content: `0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice`,
-			want: "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
+			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
 		},
 	}
 

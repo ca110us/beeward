@@ -152,8 +152,8 @@ func parsePodUID(s string) string {
 
 // CgroupInfo stores Pod UID and cgroup path for cleanup
 type CgroupInfo struct {
-	PodUID      string
-	CgroupPath  string // Path to cgroup directory (e.g., /sys/fs/cgroup/kubepods.slice/...)
+	PodUID     string
+	CgroupPath string // Path to cgroup directory (e.g., /sys/fs/cgroup/kubepods.slice/...)
 }
 
 // CgroupMapper maintains a mapping from cgroup_id to Pod info
