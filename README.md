@@ -11,6 +11,12 @@ Beeward is an eBPF agent for Kubernetes nodes that watches over NFS/EFS I/O and 
 
 Both modules run in a single DaemonSet and share one Prometheus endpoint. A failure in one module does not stop the other.
 
+## Why Beeward
+
+A shared NFS volume (Amazon EFS, Filestore, Azure Files, self-hosted NFS) is a common way to give many pods the same storage, especially across clouds. When it slows down or runs out of throughput, existing metrics can't say which pod is responsible: cloud providers report per file system, `node_exporter` reports per mount (and mounts of the same export share one client cache), and cAdvisor only covers block devices.
+
+Beeward traces NFS reads and writes in the kernel and attributes them to the pod that issued them, so a noisy neighbor on a shared volume shows up directly in Prometheus.
+
 ## Quick Start
 
 ```bash
