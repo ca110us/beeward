@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: beeward
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: beeward
+  namespace: beeward
+  labels:
+    app: beeward
+spec:
+  selector:
+    matchLabels:
+      app: beeward
+  template:
+    metadata:
+      labels:
+        app: beeward
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/monitor: unconfined
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Uncomment to run only on labeled nodes:
+      # nodeSelector:
+      #   beeward: enabled
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: monitor
+          image: ghcr.io/ca110us/beeward:latest
+          command: ["/usr/local/bin/beeward"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: METRICS_PORT
+              value: "9100"
+            - name: MONITOR_INTERVAL
+              value: "60s"
+            # --- XDP rate limiter (disabled by default) ---
+            - name: XDP_ENABLED
+              value: "false"
+            - name: XDP_SYN_RATE_LIMIT
+              value: "100"
+            - name: XDP_CONN_LIMIT
+              value: "200"
+            - name: XDP_BLACKLIST_DURATION
+              value: "600"
+            # With hostNetwork + NodePort, set these to the NodePorts of your
+            # ingress Service, not the load balancer's external ports.
+            - name: XDP_TARGET_PORTS
+              value: "443,80"
+            - name: XDP_WHITELIST_CIDRS
+              value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+          ports:
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+      volumes:
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate

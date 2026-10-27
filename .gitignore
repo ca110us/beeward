@@ -1,0 +1,27 @@
+# Binaries
+/beeward
+*.o
+
+# Generated eBPF files
+*_bpfel*.go
+*_bpfel*.o
+*_bpfeb*.go
+*_bpfeb*.o
+
+# Go
+*.test
+*.out
+vendor/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Logo drafts and design notes (final assets live in assets/)
+assets/brand/
