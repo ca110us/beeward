@@ -62,6 +62,11 @@ func TestExtractCgroupPath(t *testing.T) {
 			content: `0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice`,
 			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
 		},
+		{
+			name:    "sysfs container scope path - trimmed to Pod directory",
+			content: `/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice/cri-containerd-abc123.scope`,
+			want:    "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice",
+		},
 	}
 
 	for _, tt := range tests {

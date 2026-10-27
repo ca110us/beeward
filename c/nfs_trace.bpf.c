@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// NFS I/O Tracer - eBPF program to track NFS read/write operations per process
+// NFS I/O Tracer - eBPF program to track NFS read/write operations per cgroup
 
 // Include vmlinux.h FIRST - contains struct pt_regs and basic types
 #include "headers/vmlinux.h"
@@ -7,6 +7,7 @@
 // BPF map type constants
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_ANY 0
+#define BPF_NOEXIST 1
 
 // Now include BPF headers
 // Note: __TARGET_ARCH_x86 is defined in vmlinux.h
@@ -15,11 +16,14 @@
 #include <bpf/bpf_tracing.h>
 
 #define TASK_COMM_LEN 16
-#define MAX_ENTRIES 65536  // Increased from 10240 to support more PIDs
+#define MAX_CGROUPS 10240   // One entry per container cgroup doing NFS I/O
+#define MAX_INFLIGHT 65536  // One entry per thread with an NFS call in flight
 
-// Data structure to store I/O statistics per PID
+// Data structure to store I/O statistics per cgroup.
+// Keying by cgroup (not PID) keeps counters monotonic when processes exit
+// and avoids misattribution when a PID is reused by another Pod.
 struct io_stats {
-    __u32 pid;
+    __u32 pid;   // Last PID seen in this cgroup, used by userspace to resolve the Pod via /proc
     __u32 _pad;  // Explicit padding for 8-byte alignment
     __u64 read_bytes;
     __u64 write_bytes;
@@ -39,46 +43,53 @@ struct io_start {
     __u64 start_ns;  // Start timestamp in nanoseconds
 };
 
-// BPF Map to store per-PID I/O statistics
+// BPF Map to store per-cgroup I/O statistics
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_ENTRIES);
-    __type(key, __u32);   // PID
+    __uint(max_entries, MAX_CGROUPS);
+    __type(key, __u64);   // cgroup_id
     __type(value, struct io_stats);
-} pid_io_map SEC(".maps");
+} cgroup_io_map SEC(".maps");
 
-// BPF Map to track I/O start times (for latency calculation)
+// BPF Map to track I/O start times (for latency calculation).
+// Keyed per thread so concurrent calls in the same cgroup don't overwrite each other.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_ENTRIES);
+    __uint(max_entries, MAX_INFLIGHT);
     __type(key, __u64);   // pid_tgid
     __type(value, struct io_start);
 } read_start_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_ENTRIES);
+    __uint(max_entries, MAX_INFLIGHT);
     __type(key, __u64);   // pid_tgid
     __type(value, struct io_start);
 } write_start_map SEC(".maps");
 
-// Helper to get cgroup ID (stable across kernel versions)
-static __always_inline __u64 get_cgroup_id(void)
+// Look up (or create) the stats entry for the current task's cgroup
+static __always_inline struct io_stats *get_stats(__u64 pid_tgid)
 {
-    // bpf_get_current_cgroup_id() is a stable BPF helper
-    // It returns a unique u64 ID that doesn't change as long as cgroup exists
-    return bpf_get_current_cgroup_id();
-}
+    // bpf_get_current_cgroup_id() is a stable BPF helper: a unique ID
+    // that doesn't change as long as the cgroup exists
+    __u64 cgroup_id = bpf_get_current_cgroup_id();
 
-// Helper to populate cgroup info
-static __always_inline void read_cgroup_path(struct io_stats *stats)
-{
-    // Only get cgroup_id (always works on all kernels)
-    stats->cgroup_id = get_cgroup_id();
+    struct io_stats *stats = bpf_map_lookup_elem(&cgroup_io_map, &cgroup_id);
+    if (!stats) {
+        struct io_stats new_stats = {};
+        new_stats.cgroup_id = cgroup_id;
+        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
+        // NOEXIST: another CPU may have created the entry concurrently
+        bpf_map_update_elem(&cgroup_io_map, &cgroup_id, &new_stats, BPF_NOEXIST);
+        stats = bpf_map_lookup_elem(&cgroup_io_map, &cgroup_id);
+        if (!stats)
+            return 0;
+    }
 
-    // Keep it simple: Go will handle Pod UID extraction using:
-    // 1. Try /proc/<pid>/cgroup (fast, works if process still alive)
-    // 2. Fallback: find /sys/fs/cgroup -inum <cgroup_id> (slower but always works)
+    // Go resolves the Pod via /proc/<pid>/cgroup, falling back to an inode
+    // search of /sys/fs/cgroup by cgroup_id if this PID has already exited
+    stats->pid = pid_tgid >> 32;
+    return stats;
 }
 
 // Hook into NFS file read operations
@@ -87,7 +98,6 @@ SEC("kprobe/nfs_file_read")
 int trace_nfs_read_entry(struct pt_regs *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
 
     // Record start time for latency calculation
     struct io_start start = {
@@ -95,17 +105,7 @@ int trace_nfs_read_entry(struct pt_regs *ctx)
     };
     bpf_map_update_elem(&read_start_map, &pid_tgid, &start, BPF_ANY);
 
-    struct io_stats *stats, new_stats = {};
-
-    stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    if (!stats) {
-        new_stats.pid = pid;
-        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
-        read_cgroup_path(&new_stats);  // Just populate cgroup_id
-        bpf_map_update_elem(&pid_io_map, &pid, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    }
-
+    struct io_stats *stats = get_stats(pid_tgid);
     if (stats) {
         __sync_fetch_and_add(&stats->read_count, 1);
     }
@@ -118,7 +118,6 @@ SEC("kretprobe/nfs_file_read")
 int BPF_KRETPROBE(trace_nfs_read_exit, long ret)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
 
     // Calculate latency
     struct io_start *start = bpf_map_lookup_elem(&read_start_map, &pid_tgid);
@@ -134,18 +133,7 @@ int BPF_KRETPROBE(trace_nfs_read_exit, long ret)
         return 0;
     }
 
-    struct io_stats *stats, new_stats = {};
-
-    stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    if (!stats) {
-        // kretprobe executes after kprobe, but create entry if PID doesn't exist
-        new_stats.pid = pid;
-        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
-        read_cgroup_path(&new_stats);  // Just populate cgroup_id
-        bpf_map_update_elem(&pid_io_map, &pid, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    }
-
+    struct io_stats *stats = get_stats(pid_tgid);
     if (stats) {
         __sync_fetch_and_add(&stats->read_bytes, (__u64)ret);
 
@@ -168,7 +156,6 @@ SEC("kprobe/nfs_file_write")
 int trace_nfs_write_entry(struct pt_regs *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
 
     // Record start time for latency calculation
     struct io_start start = {
@@ -176,17 +163,7 @@ int trace_nfs_write_entry(struct pt_regs *ctx)
     };
     bpf_map_update_elem(&write_start_map, &pid_tgid, &start, BPF_ANY);
 
-    struct io_stats *stats, new_stats = {};
-
-    stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    if (!stats) {
-        new_stats.pid = pid;
-        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
-        read_cgroup_path(&new_stats);  // Just populate cgroup_id
-        bpf_map_update_elem(&pid_io_map, &pid, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    }
-
+    struct io_stats *stats = get_stats(pid_tgid);
     if (stats) {
         __sync_fetch_and_add(&stats->write_count, 1);
     }
@@ -199,7 +176,6 @@ SEC("kretprobe/nfs_file_write")
 int BPF_KRETPROBE(trace_nfs_write_exit, long ret)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
 
     // Calculate latency
     struct io_start *start = bpf_map_lookup_elem(&write_start_map, &pid_tgid);
@@ -214,18 +190,7 @@ int BPF_KRETPROBE(trace_nfs_write_exit, long ret)
         return 0;
     }
 
-    struct io_stats *stats, new_stats = {};
-
-    stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    if (!stats) {
-        // kretprobe executes after kprobe, but create entry if PID doesn't exist
-        new_stats.pid = pid;
-        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
-        read_cgroup_path(&new_stats);  // Just populate cgroup_id
-        bpf_map_update_elem(&pid_io_map, &pid, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&pid_io_map, &pid);
-    }
-
+    struct io_stats *stats = get_stats(pid_tgid);
     if (stats) {
         __sync_fetch_and_add(&stats->write_bytes, (__u64)ret);
 

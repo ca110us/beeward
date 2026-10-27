@@ -1,21 +1,34 @@
 package nfs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 
 	"github.com/ca110us/beeward/pkg/cgroup"
 	"github.com/ca110us/beeward/pkg/metrics"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-D__TARGET_ARCH_x86" -type io_stats nfs_trace ../../c/nfs_trace.bpf.c
+
+const (
+	// idleCgroupTimeout is how long a cgroup can go without NFS I/O before its
+	// BPF entry is evicted. Its contribution stays in the Pod totals, so this
+	// only bounds map usage (e.g. host cgroups that never resolve to a Pod).
+	idleCgroupTimeout = time.Hour
+
+	// staleStartAge is how old an I/O start entry must be before it is treated
+	// as orphaned (thread killed mid-call, so the kretprobe never ran).
+	// Kept long so genuinely hung NFS calls still report their latency.
+	staleStartAge = time.Hour
+)
 
 // Monitor represents an NFS I/O monitor
 type Monitor struct {
@@ -25,7 +38,9 @@ type Monitor struct {
 	writeKp        link.Link
 	writeKretprobe link.Link
 	cgroupMapper   *cgroup.CgroupMapper
-	previousStats  map[uint32]IOStats
+	previousStats  map[uint64]IOStats   // Last BPF snapshot per cgroup, for computing deltas
+	lastActive     map[uint64]time.Time // When each cgroup's counters last changed
+	podTotals      map[string]*PodStats // Monotonic totals per Pod UID
 	nodeName       string
 }
 
@@ -51,7 +66,9 @@ func NewMonitor(nodeName string) (*Monitor, error) {
 	m := &Monitor{
 		objs:          objs,
 		cgroupMapper:  cgroup.NewCgroupMapper(),
-		previousStats: make(map[uint32]IOStats),
+		previousStats: make(map[uint64]IOStats),
+		lastActive:    make(map[uint64]time.Time),
+		podTotals:     make(map[string]*PodStats),
 		nodeName:      nodeName,
 	}
 
@@ -155,94 +172,47 @@ func (m *Monitor) Run(ctx context.Context, interval time.Duration) error {
 // collectAndUpdateMetrics reads BPF map and updates Prometheus metrics
 func (m *Monitor) collectAndUpdateMetrics() error {
 	var (
-		key  uint32
+		key  uint64
 		stat IOStats
 	)
 
-	currentStats := make(map[uint32]IOStats)
-	newPIDs := make(map[uint32]bool) // Track new PIDs we haven't seen before
-	iter := m.objs.PidIoMap.Iterate()
-
+	now := time.Now()
 	entryCount := 0
+	iter := m.objs.CgroupIoMap.Iterate()
+
 	for iter.Next(&key, &stat) {
-		currentStats[key] = stat
 		entryCount++
 
-		// Check if this is a new PID
-		if _, seen := m.previousStats[key]; !seen {
-			newPIDs[key] = true
+		prev, seen := m.previousStats[key]
+		if !seen {
+			m.resolveCgroup(key, stat.PID)
+		} else if prev == stat {
+			continue // No I/O since last collection
 		}
+
+		// Get Pod UID from cgroup_id mapping
+		podUID := m.cgroupMapper.Get(key)
+		if podUID == "" {
+			podUID = "unknown"
+		}
+
+		totals := m.podTotals[podUID]
+		if totals == nil {
+			totals = &PodStats{}
+			m.podTotals[podUID] = totals
+		}
+		totals.addDelta(prev, stat)
+
+		m.previousStats[key] = stat
+		m.lastActive[key] = now
 	}
 
 	if err := iter.Err(); err != nil {
 		return fmt.Errorf("failed to iterate BPF map: %w", err)
 	}
 
-	// For new PIDs, try to get Pod UID with automatic fallback
-	for pid := range newPIDs {
-		stat := currentStats[pid]
-		if stat.CgroupID != 0 && !m.cgroupMapper.Exists(stat.CgroupID) {
-			// Use unified function with automatic fallback
-			podUID, cgroupPath := cgroup.GetPodUID(pid, stat.CgroupID)
-
-			if podUID == "" {
-				// Failed to get Pod UID even with fallback
-				log.Printf("WARNING: Failed to resolve Pod UID for cgroup_id=%d pid=%d (process may have exited before detection)",
-					stat.CgroupID, pid)
-				continue
-			}
-
-			// Success - cache the mapping with cgroup path for cleanup
-			m.cgroupMapper.Set(stat.CgroupID, podUID, cgroupPath)
-			log.Printf("DEBUG: Mapped cgroup_id %d -> Pod %s (path: %s)", stat.CgroupID, podUID, cgroupPath)
-		}
-	}
-
-	log.Printf("Tracking %d PIDs across %d pods", entryCount, m.cgroupMapper.Len())
-
-	// Aggregate stats by Pod UID and update Prometheus metrics
-	currentPodStats := make(map[string]PodStats)
-
-	for pid, current := range currentStats {
-		// Update previous stats for next iteration
-		m.previousStats[pid] = current
-
-		// Get Pod UID from cgroup_id mapping
-		podUID := m.cgroupMapper.Get(current.CgroupID)
-		if podUID == "" {
-			podUID = "unknown"
-		}
-
-		// Aggregate by Pod UID
-		stats, exists := currentPodStats[podUID]
-		if !exists {
-			stats = PodStats{
-				PodUID: podUID,
-				Comm:   string(bytes.TrimRight(current.Comm[:], "\x00")),
-				PIDs:   []uint32{},
-			}
-		}
-		stats.ReadBytes += current.ReadBytes
-		stats.WriteBytes += current.WriteBytes
-		stats.ReadCount += current.ReadCount
-		stats.WriteCount += current.WriteCount
-		stats.ReadIOTimeNs += current.ReadIOTimeNs
-		stats.WriteIOTimeNs += current.WriteIOTimeNs
-
-		// Track maximum latency across all PIDs in this pod
-		if current.ReadLatencyMaxNs > stats.ReadLatencyMaxNs {
-			stats.ReadLatencyMaxNs = current.ReadLatencyMaxNs
-		}
-		if current.WriteLatencyMaxNs > stats.WriteLatencyMaxNs {
-			stats.WriteLatencyMaxNs = current.WriteLatencyMaxNs
-		}
-
-		stats.PIDs = append(stats.PIDs, pid)
-		currentPodStats[podUID] = stats
-	}
-
 	// Update Prometheus metrics for all pods
-	for podUID, stats := range currentPodStats {
+	for podUID, stats := range m.podTotals {
 		metrics.NFSReadBytes.WithLabelValues(podUID, m.nodeName).Set(float64(stats.ReadBytes))
 		metrics.NFSWriteBytes.WithLabelValues(podUID, m.nodeName).Set(float64(stats.WriteBytes))
 		metrics.NFSReadOps.WithLabelValues(podUID, m.nodeName).Set(float64(stats.ReadCount))
@@ -255,52 +225,37 @@ func (m *Monitor) collectAndUpdateMetrics() error {
 		metrics.NFSWriteLatencyMax.WithLabelValues(podUID, m.nodeName).Set(float64(stats.WriteLatencyMaxNs) / 1e9)
 	}
 
-	log.Printf("Updated metrics for %d pods (%d PIDs tracked)", len(currentPodStats), entryCount)
+	log.Printf("Updated metrics for %d pods (%d cgroups tracked)", len(m.podTotals), entryCount)
 
-	// Clean up deleted cgroups first (removes entire Pods and all their PIDs)
-	// This will also clean up BPF map, previousStats, metrics, and cgroup mappings
+	// Clean up deleted Pods (removes their cgroups, totals and metrics)
 	m.cleanupDeletedCgroups()
 
-	// Then clean up individual dead PIDs (for processes that exited but Pod still exists)
-	m.cleanupDeadPIDs()
+	// Bound map usage: drop cgroups with no recent I/O and orphaned start entries
+	m.evictIdleCgroups(now)
+	m.cleanupStaleStartMaps()
 
 	return nil
 }
 
-// cleanupDeadPIDs removes PIDs that are no longer alive (processes have exited)
-// This prevents map exhaustion from short-lived processes
-func (m *Monitor) cleanupDeadPIDs() {
-	var key uint32
-	var stat IOStats
-	iter := m.objs.PidIoMap.Iterate()
-
-	var deadPIDs []uint32
-
-	// Iterate through all PIDs and check if they're still alive
-	for iter.Next(&key, &stat) {
-		if !m.isPIDAlive(key) {
-			deadPIDs = append(deadPIDs, key)
-		}
+// resolveCgroup maps a newly seen cgroup to its Pod UID, using the last PID
+// seen in it for the fast /proc lookup
+func (m *Monitor) resolveCgroup(cgroupID uint64, pid uint32) {
+	if cgroupID == 0 || m.cgroupMapper.Exists(cgroupID) {
+		return
 	}
 
-	// Clean up dead PIDs
-	for _, pid := range deadPIDs {
-		m.objs.PidIoMap.Delete(&pid)
-		delete(m.previousStats, pid)
+	// Use unified function with automatic fallback
+	podUID, cgroupPath := cgroup.GetPodUID(pid, cgroupID)
+	if podUID == "" {
+		// Failed to get Pod UID even with fallback
+		log.Printf("WARNING: Failed to resolve Pod UID for cgroup_id=%d pid=%d (not a Pod, or process exited before detection)",
+			cgroupID, pid)
+		return
 	}
 
-	// Also clean up their start_map entries
-	if len(deadPIDs) > 0 {
-		m.cleanupStartMaps(deadPIDs)
-		log.Printf("Cleaned up %d dead PIDs", len(deadPIDs))
-	}
-}
-
-// isPIDAlive checks if a PID still exists on the system
-func (m *Monitor) isPIDAlive(pid uint32) bool {
-	// Check if /proc/<pid> exists
-	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
-	return err == nil
+	// Success - cache the mapping with cgroup path for cleanup
+	m.cgroupMapper.Set(cgroupID, podUID, cgroupPath)
+	log.Printf("DEBUG: Mapped cgroup_id %d -> Pod %s (path: %s)", cgroupID, podUID, cgroupPath)
 }
 
 // cleanupDeletedCgroups removes cgroups (Pods) that no longer exist
@@ -330,7 +285,8 @@ func (m *Monitor) cleanupDeletedCgroups() {
 	}
 }
 
-// cleanupCgroup removes all data associated with a cgroup (Pod)
+// cleanupCgroup removes all data associated with a cgroup, and the Pod's
+// totals and metrics once none of its cgroups are tracked anymore
 func (m *Monitor) cleanupCgroup(cgroupID uint64) {
 	info := m.cgroupMapper.GetInfo(cgroupID)
 	if info == nil {
@@ -339,28 +295,18 @@ func (m *Monitor) cleanupCgroup(cgroupID uint64) {
 
 	podUID := info.PodUID
 
-	// 1. Delete all PIDs belonging to this cgroup from BPF map and previousStats
-	var key uint32
-	var stat IOStats
-	iter := m.objs.PidIoMap.Iterate()
+	// 1. Delete the cgroup from BPF map and Go-side state
+	m.objs.CgroupIoMap.Delete(&cgroupID)
+	delete(m.previousStats, cgroupID)
+	delete(m.lastActive, cgroupID)
+	m.cgroupMapper.Delete(cgroupID)
 
-	var pidsToDelete []uint32
-	for iter.Next(&key, &stat) {
-		if stat.CgroupID == cgroupID {
-			pidsToDelete = append(pidsToDelete, key)
-		}
+	if m.cgroupMapper.HasPod(podUID) {
+		return
 	}
 
-	for _, pid := range pidsToDelete {
-		m.objs.PidIoMap.Delete(&pid)
-		delete(m.previousStats, pid)
-	}
-
-	// Clean up start time maps (for interrupted I/O operations)
-	// These maps use pid_tgid as key, so we need to iterate
-	m.cleanupStartMaps(pidsToDelete)
-
-	// 2. Delete Prometheus metrics
+	// 2. Delete Pod totals and Prometheus metrics
+	delete(m.podTotals, podUID)
 	metrics.NFSReadBytes.DeleteLabelValues(podUID, m.nodeName)
 	metrics.NFSWriteBytes.DeleteLabelValues(podUID, m.nodeName)
 	metrics.NFSReadOps.DeleteLabelValues(podUID, m.nodeName)
@@ -370,59 +316,64 @@ func (m *Monitor) cleanupCgroup(cgroupID uint64) {
 	metrics.NFSReadLatencyMax.DeleteLabelValues(podUID, m.nodeName)
 	metrics.NFSWriteLatencyMax.DeleteLabelValues(podUID, m.nodeName)
 
-	// 3. Delete cgroup mapping
-	m.cgroupMapper.Delete(cgroupID)
-
-	log.Printf("Cleaned up Pod %s (cgroup_id=%d, %d PIDs deleted)", podUID, cgroupID, len(pidsToDelete))
+	log.Printf("Cleaned up Pod %s (cgroup_id=%d)", podUID, cgroupID)
 }
 
-// cleanupStartMaps removes entries from read_start_map and write_start_map for deleted PIDs
-// These maps track I/O start times and may have orphaned entries if processes were killed during I/O
-// Normally, kretprobe will delete these entries, but we clean up here as a safeguard
-func (m *Monitor) cleanupStartMaps(pidsToDelete []uint32) {
-	if len(pidsToDelete) == 0 {
+// evictIdleCgroups drops BPF entries for cgroups with no I/O for
+// idleCgroupTimeout. Pod totals and cgroup mappings are kept, so if the
+// cgroup becomes active again its fresh counters are simply added on top.
+func (m *Monitor) evictIdleCgroups(now time.Time) {
+	evicted := 0
+	for cgroupID, last := range m.lastActive {
+		if now.Sub(last) < idleCgroupTimeout {
+			continue
+		}
+		m.objs.CgroupIoMap.Delete(&cgroupID)
+		delete(m.previousStats, cgroupID)
+		delete(m.lastActive, cgroupID)
+		evicted++
+	}
+
+	if evicted > 0 {
+		log.Printf("Evicted %d idle cgroups", evicted)
+	}
+}
+
+// cleanupStaleStartMaps removes orphaned entries from read_start_map and write_start_map.
+// Normally the kretprobe deletes them, but a thread killed during I/O leaves one behind.
+func (m *Monitor) cleanupStaleStartMaps() {
+	// bpf_ktime_get_ns() uses CLOCK_MONOTONIC
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
 		return
 	}
-
-	// Create a set of PIDs to delete for fast lookup
-	pidSet := make(map[uint32]bool)
-	for _, pid := range pidsToDelete {
-		pidSet[pid] = true
+	now := uint64(ts.Nano())
+	if now < uint64(staleStartAge) {
+		return
 	}
+	cutoff := now - uint64(staleStartAge)
 
-	// Clean up read_start_map
-	var readKey uint64
-	var readVal nfs_traceIoStart
-	readIter := m.objs.ReadStartMap.Iterate()
-	var readKeysToDelete []uint64
-	for readIter.Next(&readKey, &readVal) {
-		pid := uint32(readKey >> 32) // Extract PID from pid_tgid
-		if pidSet[pid] {
-			readKeysToDelete = append(readKeysToDelete, readKey)
+	removed := 0
+	for _, startMap := range []*ebpf.Map{m.objs.ReadStartMap, m.objs.WriteStartMap} {
+		var (
+			key  uint64
+			val  nfs_traceIoStart
+			keys []uint64
+		)
+		iter := startMap.Iterate()
+		for iter.Next(&key, &val) {
+			if val.StartNs < cutoff {
+				keys = append(keys, key)
+			}
 		}
-	}
-	for _, key := range readKeysToDelete {
-		m.objs.ReadStartMap.Delete(&key)
-	}
-
-	// Clean up write_start_map
-	var writeKey uint64
-	var writeVal nfs_traceIoStart
-	writeIter := m.objs.WriteStartMap.Iterate()
-	var writeKeysToDelete []uint64
-	for writeIter.Next(&writeKey, &writeVal) {
-		pid := uint32(writeKey >> 32) // Extract PID from pid_tgid
-		if pidSet[pid] {
-			writeKeysToDelete = append(writeKeysToDelete, writeKey)
+		for _, k := range keys {
+			startMap.Delete(&k)
 		}
-	}
-	for _, key := range writeKeysToDelete {
-		m.objs.WriteStartMap.Delete(&key)
+		removed += len(keys)
 	}
 
 	// Only log if we actually found orphaned entries (rare)
-	if len(readKeysToDelete) > 0 || len(writeKeysToDelete) > 0 {
-		log.Printf("Cleaned up %d orphaned read_start and %d write_start entries",
-			len(readKeysToDelete), len(writeKeysToDelete))
+	if removed > 0 {
+		log.Printf("Cleaned up %d orphaned I/O start entries", removed)
 	}
 }

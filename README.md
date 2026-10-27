@@ -61,10 +61,10 @@ All configuration is via environment variables.
 
 ### How it works
 
-1. **Kernel hooks** — kprobes/kretprobes on `nfs_file_read` and `nfs_file_write` record bytes, operation counts and latency per PID.
-2. **Pod resolution** — each PID is mapped to a pod UID by reading `/proc/<pid>/cgroup`, falling back to a cgroup inode search under `/sys/fs/cgroup` if the process has already exited.
-3. **Aggregation** — stats are summed per pod and exported as cumulative metrics.
-4. **Cleanup** — dead PIDs and deleted pods are detected and their map entries and metrics removed.
+1. **Kernel hooks** — kprobes/kretprobes on `nfs_file_read` and `nfs_file_write` record bytes, operation counts and latency per cgroup (container). Latency is paired per thread, so concurrent calls don't interfere.
+2. **Pod resolution** — each new cgroup is mapped to a pod UID once, by reading `/proc/<pid>/cgroup` for a PID recently seen in it, falling back to a cgroup inode search under `/sys/fs/cgroup` if that process has already exited.
+3. **Aggregation** — per-cgroup growth is added to per-pod totals, so metrics only ever increase: short-lived processes exiting or containers restarting never make a counter go backwards, and a reused PID can't attribute I/O to the wrong pod.
+4. **Cleanup** — when a pod's cgroup disappears its map entries and metrics are removed. Cgroups idle for an hour are evicted from the BPF map (their totals are kept), which bounds map usage.
 
 No Kubernetes API access is required.
 
@@ -159,7 +159,7 @@ The Dockerfile installs clang/llvm/libbpf, runs `go generate` (bpf2go) and build
 
 **High memory usage**
 
-eBPF maps are limited to 10240 entries. Increase `MAX_ENTRIES` in [c/nfs_trace.bpf.c](c/nfs_trace.bpf.c) and rebuild.
+The NFS stats map holds up to 10240 cgroups and the latency maps up to 65536 in-flight calls. Adjust `MAX_CGROUPS` / `MAX_INFLIGHT` in [c/nfs_trace.bpf.c](c/nfs_trace.bpf.c) and rebuild.
 
 ## License
 

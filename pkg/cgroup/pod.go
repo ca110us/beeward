@@ -107,6 +107,12 @@ func findPodUIDByCgroupID(cgroupID uint64) (string, string) {
 	// Extract Pod UID from path
 	// Example: /sys/fs/cgroup/kubepods.slice/kubepods-burstable-pod9b1e71e8_4787_4860_ab3c_8a8407bcff80.slice
 	podUID := parsePodUID(foundPath)
+
+	// The match is usually the container's own scope; return the Pod-level
+	// directory like the /proc path does, so cleanup waits for the Pod to go away
+	if podPath := extractCgroupPath(foundPath); podPath != "" {
+		foundPath = podPath
+	}
 	return podUID, foundPath
 }
 
@@ -199,6 +205,16 @@ func (m *CgroupMapper) Delete(cgroupID uint64) {
 func (m *CgroupMapper) Exists(cgroupID uint64) bool {
 	_, exists := m.mapping[cgroupID]
 	return exists
+}
+
+// HasPod checks if any cgroup is still mapped to the given Pod UID
+func (m *CgroupMapper) HasPod(podUID string) bool {
+	for _, info := range m.mapping {
+		if info.PodUID == podUID {
+			return true
+		}
+	}
+	return false
 }
 
 // Len returns the number of cached mappings
