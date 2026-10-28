@@ -20,16 +20,15 @@ Beeward traces NFS reads and writes in the kernel and attributes them to the pod
 ## Quick Start
 
 ```bash
-# Build and push the image (compilation happens inside the container, works on macOS)
-make docker-push IMAGE_NAME=<your-registry>/beeward IMAGE_TAG=latest
-
-# Edit deploy/daemonset.yaml (image, XDP settings), then deploy
-make deploy
+# Deploy the prebuilt image (ghcr.io/ca110us/beeward, linux/amd64)
+kubectl apply -f https://raw.githubusercontent.com/ca110us/beeward/main/deploy/daemonset.yaml
 
 # Check metrics
 kubectl -n beeward port-forward daemonset/beeward 9100:9100
 curl -s http://localhost:9100/metrics | grep -E '^(nfs|xdp)_'
 ```
+
+The XDP rate limiter is off by default. To enable it or change settings, download `deploy/daemonset.yaml`, edit the env vars (see [Configuration](#configuration)) and apply it.
 
 To run on a subset of nodes, label them and uncomment the `nodeSelector` in `deploy/daemonset.yaml`:
 
@@ -146,9 +145,10 @@ bpftool map dump pinned /sys/fs/bpf/xdp_ratelimit/blacklist_map
 make docker-build                 # build image
 make docker-push                  # build and push
 make IMAGE_NAME=my/repo IMAGE_TAG=v1 docker-push
+make deploy                       # apply deploy/daemonset.yaml (update its image first)
 ```
 
-The Dockerfile installs clang/llvm/libbpf, runs `go generate` (bpf2go) and builds a static binary on a busybox base image.
+Compilation happens inside the container, so this also works on macOS. The Dockerfile installs clang/llvm/libbpf, runs `go generate` (bpf2go) and builds a static binary on a busybox base image.
 
 ## Troubleshooting
 

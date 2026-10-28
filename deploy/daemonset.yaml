@@ -37,7 +37,7 @@ spec:
           effect: NoExecute
       containers:
         - name: monitor
-          image: ghcr.io/ca110us/beeward:latest
+          image: ghcr.io/ca110us/beeward:0.1.0
           command: ["/usr/local/bin/beeward"]
           env:
             - name: NODE_NAME
