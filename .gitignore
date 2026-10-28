@@ -25,3 +25,6 @@ vendor/
 
 # Logo drafts and design notes (final assets live in assets/)
 assets/brand/
+
+# Python
+__pycache__/
