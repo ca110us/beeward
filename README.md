@@ -4,6 +4,12 @@
 
 <h1 align="center">Beeward</h1>
 
+<p align="center">
+  <a href="https://github.com/ca110us/beeward/actions/workflows/e2e.yml"><img src="https://github.com/ca110us/beeward/actions/workflows/e2e.yml/badge.svg" alt="E2E"></a>
+  <a href="https://github.com/ca110us/beeward/actions/workflows/kernels.yml"><img src="https://github.com/ca110us/beeward/actions/workflows/kernels.yml/badge.svg" alt="Kernels"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0-blue" alt="License: GPL-2.0"></a>
+</p>
+
 Beeward is an eBPF agent for Kubernetes nodes that watches over NFS/EFS I/O and wards off abusive traffic. It has two independent modules:
 
 - **NFS/EFS I/O monitoring** — per-pod NFS throughput, IOPS and latency, traced in the kernel and exported as Prometheus metrics.
