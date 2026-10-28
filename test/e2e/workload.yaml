@@ -89,7 +89,8 @@ spec:
           # collection interval to attach its probes before doing I/O
           sleep 15
           dd if=/dev/zero of=/data/c bs=1M count=10 conv=fsync
-          cat /data/c > /dev/null
+          # read(2) path, then sendfile(2) path (busybox cat uses sendfile)
+          dd if=/data/c of=/dev/null bs=1M
           cat /data/c > /dev/null
           touch /tmp/done
           sleep 3600

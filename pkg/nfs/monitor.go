@@ -32,16 +32,13 @@ const (
 
 // Monitor represents an NFS I/O monitor
 type Monitor struct {
-	objs           *nfs_traceObjects
-	readKp         link.Link
-	readKretprobe  link.Link
-	writeKp        link.Link
-	writeKretprobe link.Link
-	cgroupMapper   *cgroup.CgroupMapper
-	previousStats  map[uint64]IOStats   // Last BPF snapshot per cgroup, for computing deltas
-	lastActive     map[uint64]time.Time // When each cgroup's counters last changed
-	podTotals      map[string]*PodStats // Monotonic totals per Pod UID
-	nodeName       string
+	objs          *nfs_traceObjects
+	links         []link.Link // kprobe/kretprobe links, empty until the nfs module is loaded
+	cgroupMapper  *cgroup.CgroupMapper
+	previousStats map[uint64]IOStats   // Last BPF snapshot per cgroup, for computing deltas
+	lastActive    map[uint64]time.Time // When each cgroup's counters last changed
+	podTotals     map[string]*PodStats // Monotonic totals per Pod UID
+	nodeName      string
 }
 
 // NewMonitor creates a new NFS monitor
@@ -78,73 +75,56 @@ func NewMonitor(nodeName string) (*Monitor, error) {
 	return m, nil
 }
 
-// NFS function names to try (kernel version dependent)
+// NFS kernel functions to trace. All that exist are attached: read(2) goes
+// through nfs_file_read, while on newer kernels sendfile/splice reads go
+// through nfs_file_splice_read instead (older kernels route them via
+// nfs_file_read, where nfs_file_splice_read doesn't exist).
 var (
-	nfsReadFunctions  = []string{"nfs_file_read", "nfs_file_read_iter", "nfs_file_splice_read"}
-	nfsWriteFunctions = []string{"nfs_file_write", "nfs_file_write_iter"}
+	nfsReadFunctions  = []string{"nfs_file_read", "nfs_file_splice_read"}
+	nfsWriteFunctions = []string{"nfs_file_write"}
 )
 
-// probesAttached reports whether both read and write probes are attached
+// probesAttached reports whether the NFS probes are attached
 func (m *Monitor) probesAttached() bool {
-	return m.readKp != nil && m.writeKp != nil
+	return len(m.links) > 0
 }
 
-// attachProbes attaches any NFS kprobes that aren't attached yet. It is
-// retried on every collection because the nfs module is usually loaded only
-// when the first NFS volume is mounted, which can be after Beeward starts.
+// attachProbes attaches the NFS kprobes. It is retried on every collection
+// until it succeeds, because the nfs module is usually loaded only when the
+// first NFS volume is mounted, which can be after Beeward starts.
 func (m *Monitor) attachProbes(warnMissing bool) {
-	if m.readKp == nil {
-		fn, kp, krp := attachKprobePair(nfsReadFunctions, m.objs.TraceNfsReadEntry, m.objs.TraceNfsReadExit)
-		if kp != nil {
-			m.readKp, m.readKretprobe = kp, krp
-			log.Printf("Attached to NFS read function: %s", fn)
-		} else if warnMissing {
-			log.Println("WARNING: Could not attach to any NFS read function (nfs module not loaded yet?), will retry")
-		}
+	for _, fn := range nfsReadFunctions {
+		m.attachKprobe(fn, "read", m.objs.TraceNfsReadEntry, m.objs.TraceNfsReadExit)
+	}
+	for _, fn := range nfsWriteFunctions {
+		m.attachKprobe(fn, "write", m.objs.TraceNfsWriteEntry, m.objs.TraceNfsWriteExit)
 	}
 
-	if m.writeKp == nil {
-		fn, kp, krp := attachKprobePair(nfsWriteFunctions, m.objs.TraceNfsWriteEntry, m.objs.TraceNfsWriteExit)
-		if kp != nil {
-			m.writeKp, m.writeKretprobe = kp, krp
-			log.Printf("Attached to NFS write function: %s", fn)
-		} else if warnMissing {
-			log.Println("WARNING: Could not attach to any NFS write function (nfs module not loaded yet?), will retry")
-		}
+	if !m.probesAttached() && warnMissing {
+		log.Println("WARNING: Could not attach to any NFS function (nfs module not loaded yet?), will retry")
 	}
 }
 
-// attachKprobePair attaches entry/exit programs to the first function that
-// supports both, returning nil links if none does
-func attachKprobePair(fns []string, entry, exit *ebpf.Program) (string, link.Link, link.Link) {
-	for _, fn := range fns {
-		kp, err := link.Kprobe(fn, entry, nil)
-		if err != nil {
-			continue
-		}
-		krp, err := link.Kretprobe(fn, exit, nil)
-		if err != nil {
-			kp.Close()
-			continue
-		}
-		return fn, kp, krp
+// attachKprobe attaches entry/exit programs to fn, skipping it if fn
+// doesn't exist on this kernel
+func (m *Monitor) attachKprobe(fn, kind string, entry, exit *ebpf.Program) {
+	kp, err := link.Kprobe(fn, entry, nil)
+	if err != nil {
+		return
 	}
-	return "", nil, nil
+	krp, err := link.Kretprobe(fn, exit, nil)
+	if err != nil {
+		kp.Close()
+		return
+	}
+	m.links = append(m.links, kp, krp)
+	log.Printf("Attached to NFS %s function: %s", kind, fn)
 }
 
 // Close cleans up resources
 func (m *Monitor) Close() error {
-	if m.readKp != nil {
-		m.readKp.Close()
-	}
-	if m.readKretprobe != nil {
-		m.readKretprobe.Close()
-	}
-	if m.writeKp != nil {
-		m.writeKp.Close()
-	}
-	if m.writeKretprobe != nil {
-		m.writeKretprobe.Close()
+	for _, l := range m.links {
+		l.Close()
 	}
 	if m.objs != nil {
 		return m.objs.Close()

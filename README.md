@@ -66,7 +66,7 @@ All configuration is via environment variables.
 
 ### How it works
 
-1. **Kernel hooks** — kprobes/kretprobes on `nfs_file_read` and `nfs_file_write` record bytes, operation counts and latency per cgroup (container). Latency is paired per thread, so concurrent calls don't interfere.
+1. **Kernel hooks** — kprobes/kretprobes on `nfs_file_read`, `nfs_file_splice_read` (sendfile/splice, newer kernels) and `nfs_file_write` record bytes, operation counts and latency per cgroup (container). Latency is paired per thread, so concurrent calls don't interfere. Probes attach as soon as the `nfs` module is loaded, even if that happens after Beeward starts.
 2. **Pod resolution** — each new cgroup is mapped to a pod UID once, by reading `/proc/<pid>/cgroup` for a PID recently seen in it, falling back to a cgroup inode search under `/sys/fs/cgroup` if that process has already exited.
 3. **Aggregation** — per-cgroup growth is added to per-pod totals, so metrics only ever increase: short-lived processes exiting or containers restarting never make a counter go backwards, and a reused PID can't attribute I/O to the wrong pod.
 4. **Cleanup** — when a pod's cgroup disappears its map entries and metrics are removed. Cgroups idle for an hour are evicted from the BPF map (their totals are kept), which bounds map usage.
