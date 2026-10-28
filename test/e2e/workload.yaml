@@ -1,0 +1,98 @@
+# Pods sharing one NFS export, each doing a known amount of I/O.
+# NFS_SERVER is replaced by the e2e workflow. A pod turns Ready once its I/O is done.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer-a
+  labels:
+    app: nfs-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: main
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          # Three short-lived processes, each exiting before the next collection:
+          # the pod's total must keep all of them
+          for i in 1 2 3; do
+            dd if=/dev/zero of=/data/a-$i bs=1M count=10 conv=fsync
+            sleep 8
+          done
+          touch /tmp/done
+          sleep 3600
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/tmp/done"]
+        periodSeconds: 2
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      nfs:
+        server: NFS_SERVER
+        path: /srv/nfs
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer-b
+  labels:
+    app: nfs-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: main
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          dd if=/dev/zero of=/data/b bs=1M count=60 conv=fsync
+          touch /tmp/done
+          sleep 3600
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/tmp/done"]
+        periodSeconds: 2
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      nfs:
+        server: NFS_SERVER
+        path: /srv/nfs
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reader-c
+  labels:
+    app: nfs-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: main
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          dd if=/dev/zero of=/data/c bs=1M count=10 conv=fsync
+          cat /data/c > /dev/null
+          cat /data/c > /dev/null
+          touch /tmp/done
+          sleep 3600
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/tmp/done"]
+        periodSeconds: 2
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      nfs:
+        server: NFS_SERVER
+        path: /srv/nfs

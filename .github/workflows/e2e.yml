@@ -1,0 +1,74 @@
+name: E2E
+
+# Runs Beeward on a single-node k3s cluster with a real NFS server on the runner,
+# then checks per-pod NFS metrics against a workload with known I/O.
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t beeward:e2e .
+
+      - name: Start NFS server
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nfs-kernel-server nfs-common
+          sudo mkdir -p /srv/nfs
+          sudo chmod 777 /srv/nfs
+          echo '/srv/nfs *(rw,sync,no_subtree_check,no_root_squash,insecure)' | sudo tee /etc/exports
+          sudo exportfs -ra
+          sudo systemctl restart nfs-server
+          echo "NFS_SERVER=$(hostname -I | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Start k3s
+        run: |
+          curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE=644 \
+            INSTALL_K3S_EXEC="--disable traefik --disable metrics-server" sh -
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 2; done
+          docker save beeward:e2e | sudo k3s ctr images import -
+
+      # Deployed before any NFS mount exists, like a fresh node
+      - name: Deploy Beeward
+        run: |
+          yq 'select(.kind == "DaemonSet") |= (
+                .spec.template.spec.containers[0].image = "docker.io/library/beeward:e2e" |
+                .spec.template.spec.containers[0].imagePullPolicy = "Never" |
+                (.spec.template.spec.containers[0].env[] | select(.name == "MONITOR_INTERVAL") | .value) = "5s" |
+                (.spec.template.spec.containers[0].env[] | select(.name == "XDP_ENABLED") | .value) = "true" |
+                (.spec.template.spec.containers[0].env[] | select(.name == "XDP_TARGET_PORTS") | .value) = "18080"
+              )' deploy/daemonset.yaml | kubectl apply -f -
+          kubectl -n beeward rollout status daemonset/beeward --timeout=120s
+
+      - name: Run NFS workload
+        run: sed "s/NFS_SERVER/$NFS_SERVER/" test/e2e/workload.yaml | kubectl apply -f -
+
+      - name: Check per-pod metrics
+        run: python3 test/e2e/check.py
+
+      - name: Check probes attached
+        run: |
+          kubectl -n beeward logs daemonset/beeward > beeward.log
+          grep -q "Attached to NFS read function" beeward.log
+          grep -q "Attached to NFS write function" beeward.log
+          grep -q "\[XDP\] Rate limiter active" beeward.log
+
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n beeward logs daemonset/beeward --tail=200 || true
+          kubectl describe pods -l app=nfs-e2e || true
+          curl -s http://127.0.0.1:9100/metrics | grep -E '^(nfs|xdp)_' || true
