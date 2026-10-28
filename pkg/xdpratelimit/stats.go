@@ -65,6 +65,7 @@ func (rl *RateLimiter) collectStats() {
 	// Map entry counts
 	XDPMapEntries.WithLabelValues("syn_rate").Set(float64(countMapEntries(rl.objs.SynRateMap)))
 	XDPMapEntries.WithLabelValues("conn_count").Set(float64(countMapEntries(rl.objs.ConnCountMap)))
+	XDPMapEntries.WithLabelValues("conn_track").Set(float64(countMapEntries(rl.objs.ConnTrackMap)))
 
 	blCount := countMapEntries(rl.objs.BlacklistMap)
 	XDPMapEntries.WithLabelValues("blacklist").Set(float64(blCount))

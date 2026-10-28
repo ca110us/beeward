@@ -68,11 +68,14 @@ jobs:
           cpu-kind: ''
           install-dependencies: true
           host-mount: ./
-          port-forward: '9100:9100'
+          port-forward: '9100:9100,18080:18080,18081:18081'
           cmd: bash /host/test/vm/run-in-vm.sh ${{ env.NFS_SERVER }}
 
       - name: Check per-pod metrics
         run: python3 test/e2e/check.py --pods "$PODS"
+
+      - name: Check XDP connection limit
+        run: python3 test/vm/xdp-check.py
 
       - name: Check probes attached
         uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31

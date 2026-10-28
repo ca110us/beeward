@@ -57,6 +57,7 @@ All configuration is via environment variables.
 | `XDP_SYN_RATE_LIMIT` | `100` | Max SYN packets per second per source IP (token bucket rate and capacity) |
 | `XDP_CONN_LIMIT` | `200` | Max concurrent TCP connections per source IP |
 | `XDP_BLACKLIST_DURATION` | `600` | Seconds a source IP stays blocked after exceeding a limit |
+| `XDP_CONN_IDLE_TIMEOUT` | `300` | Seconds without packets from the client before a connection stops counting toward the limit |
 | `XDP_WHITELIST_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Source CIDRs that bypass all checks |
 | `XDP_PIN_PATH` | `/sys/fs/bpf/xdp_ratelimit` | Where BPF maps are pinned for inspection with `bpftool` |
 
@@ -109,7 +110,7 @@ For every IPv4 TCP packet to a protected port:
 1. **Whitelist** — source IPs matching `XDP_WHITELIST_CIDRS` (LPM trie) pass immediately.
 2. **Blacklist** — blacklisted source IPs are dropped until their entry expires.
 3. **SYN rate** — each SYN consumes a token from a per-IP token bucket refilled at `XDP_SYN_RATE_LIMIT` per second. An empty bucket blacklists the IP.
-4. **Connection limit** — a per-IP counter is incremented on new connections and decremented by a TC egress program that watches outbound FIN/RST. Exceeding `XDP_CONN_LIMIT` blacklists the IP.
+4. **Connection limit** — each connection is tracked by its 4-tuple, so it is counted exactly once: retransmitted SYNs don't count again, and the first FIN/RST from either side (client FIN/RST in XDP, server FIN/RST in a TC egress program) counts it down. Connections that end without a visible FIN/RST, such as a vanished client, stop counting after `XDP_CONN_IDLE_TIMEOUT`. A new connection beyond `XDP_CONN_LIMIT` blacklists the IP.
 
 The program tries native XDP first and falls back to generic (SKB) mode if the driver does not support it. The main interface is detected from the default route in `/proc/net/route`. Non-TCP, non-IPv4 and unprotected-port traffic is always passed.
 
@@ -135,7 +136,7 @@ bpftool map dump pinned /sys/fs/bpf/xdp_ratelimit/blacklist_map
 ## Requirements
 
 - Linux 5.10 or newer, cgroup v2. CI tests 5.10, 5.15, 6.1, 6.6, 6.12, 6.18 and 7.0
-- The XDP rate limiter's connection limit needs Linux 6.6+ to track closed connections (TCX); on older kernels the per-IP connection count only grows
+- Server-initiated closes are seen immediately on Linux 6.6+ (TC egress via TCX); on older kernels a server close is counted when the client answers with its own FIN, or after `XDP_CONN_IDLE_TIMEOUT` if it never does
 - NFS client functions present in the kernel (`grep nfs_file /proc/kallsyms`) for the NFS module
 - Pod privileges: `privileged: true`, `hostPID: true`, `hostNetwork: true`
 - Host mounts: `/sys/kernel/debug` (kprobes) and `/sys/fs/bpf` (map pinning)

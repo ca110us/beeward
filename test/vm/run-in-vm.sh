@@ -12,9 +12,16 @@ apt-get update -q
 apt-get install -y -q nfs-common
 gcc -O2 -o /usr/local/bin/sendfile-read /host/test/vm/sendfile.c
 
-# Start Beeward before anything is mounted, like on a fresh node
+# Servers for test/vm/xdp-check.py: echo (client closes) and one that closes
+# after 0.2s (server closes)
+setsid socat TCP-LISTEN:18080,fork,reuseaddr EXEC:cat > /dev/null 2>&1 < /dev/null &
+setsid socat TCP-LISTEN:18081,fork,reuseaddr SYSTEM:'sleep 0.2' > /dev/null 2>&1 < /dev/null &
+
+# Start Beeward before anything is mounted, like on a fresh node. The
+# whitelist leaves out 10.0.2.2, where port-forwarded test connections come from.
 setsid env NODE_NAME=vm MONITOR_INTERVAL=2s METRICS_PORT=9100 \
-  XDP_ENABLED=true XDP_TARGET_PORTS=18080 \
+  XDP_ENABLED=true XDP_TARGET_PORTS=18080,18081 XDP_CONN_LIMIT=20 XDP_SYN_RATE_LIMIT=10000 \
+  XDP_WHITELIST_CIDRS=192.0.2.0/24 \
   /host/beeward > /tmp/beeward.log 2>&1 < /dev/null &
 
 mkdir -p /mnt/nfs

@@ -12,6 +12,7 @@ type Config struct {
 	SynRateLimit      int      // Max SYN packets per second per IP
 	ConnLimit         int      // Max concurrent connections per IP
 	BlacklistDuration int      // Blacklist duration in seconds
+	ConnIdleTimeout   int      // Seconds without client packets before a connection stops counting
 	WhitelistCIDRs    []string // CIDR ranges to whitelist
 	TargetPorts       []int    // Ports to protect
 	PinPath           string   // BPF map pin directory
@@ -23,6 +24,7 @@ func LoadConfig() *Config {
 		SynRateLimit:      envInt("XDP_SYN_RATE_LIMIT", 100),
 		ConnLimit:         envInt("XDP_CONN_LIMIT", 200),
 		BlacklistDuration: envInt("XDP_BLACKLIST_DURATION", 600),
+		ConnIdleTimeout:   envInt("XDP_CONN_IDLE_TIMEOUT", 300),
 		WhitelistCIDRs:    envStringSlice("XDP_WHITELIST_CIDRS", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"),
 		TargetPorts:       envIntSlice("XDP_TARGET_PORTS", "443,80"),
 		PinPath:           envString("XDP_PIN_PATH", "/sys/fs/bpf/xdp_ratelimit"),
@@ -40,6 +42,10 @@ func LoadConfig() *Config {
 	if cfg.BlacklistDuration <= 0 {
 		log.Printf("[XDP] WARNING: invalid XDP_BLACKLIST_DURATION=%d, using default 600", cfg.BlacklistDuration)
 		cfg.BlacklistDuration = 600
+	}
+	if cfg.ConnIdleTimeout <= 0 {
+		log.Printf("[XDP] WARNING: invalid XDP_CONN_IDLE_TIMEOUT=%d, using default 300", cfg.ConnIdleTimeout)
+		cfg.ConnIdleTimeout = 300
 	}
 
 	// Validate ports: filter out-of-range values

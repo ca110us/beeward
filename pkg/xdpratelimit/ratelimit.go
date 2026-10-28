@@ -12,7 +12,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-D__TARGET_ARCH_x86" -type config -type rate_info -type lpm_key xdp_ratelimit ../../c/xdp_ratelimit.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-D__TARGET_ARCH_x86" -type config -type rate_info -type lpm_key -type conn_key -type conn_info xdp_ratelimit ../../c/xdp_ratelimit.bpf.c
 
 // RateLimiter manages the XDP rate limiting program
 type RateLimiter struct {
@@ -86,7 +86,8 @@ func Run(ctx context.Context) error {
 		Interface: ifaceIndex,
 	})
 	if err != nil {
-		log.Printf("[XDP] WARNING: TC egress attach failed: %v (conn_count may drift)", err)
+		log.Printf("[XDP] TC egress unavailable (%v): connections closed by the server are counted down after %ds idle instead",
+			err, cfg.ConnIdleTimeout)
 	} else {
 		log.Printf("[XDP] Attached TC egress on %s for conn_count tracking", ifaceName)
 	}
@@ -117,6 +118,7 @@ func Run(ctx context.Context) error {
 	// Publish config as metrics
 	XDPConfigGauge.WithLabelValues("syn_rate_limit").Set(float64(cfg.SynRateLimit))
 	XDPConfigGauge.WithLabelValues("conn_limit").Set(float64(cfg.ConnLimit))
+	XDPConfigGauge.WithLabelValues("conn_idle_timeout").Set(float64(cfg.ConnIdleTimeout))
 
 	log.Printf("[XDP] Rate limiter active on %s", ifaceName)
 

@@ -7,6 +7,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef BPF_NOEXIST
+#define BPF_NOEXIST 1
+#endif
+
 // --- Stats map key indices ---
 
 #define STATS_TOTAL_PACKETS      0
@@ -35,7 +39,19 @@ struct config {
     __u64 blacklist_duration_ns;  // Blacklist duration in nanoseconds
 };
 
-// --- BPF Maps (7 total) ---
+// A TCP connection to a protected port, as seen on ingress (network byte order)
+struct conn_key {
+    __u32 client_ip;
+    __u32 server_ip;
+    __u16 client_port;
+    __u16 server_port;
+};
+
+struct conn_info {
+    __u64 last_seen_ns;  // Last packet from the client (ktime_ns), for idle cleanup
+};
+
+// --- BPF Maps (8 total) ---
 
 // 1. Per-IP SYN rate tracking (token bucket state)
 struct {
@@ -94,6 +110,17 @@ struct {
     __uint(max_entries, 16);
 } protected_ports_map SEC(".maps");
 
+// 8. Open connections, so each is counted in conn_count_map exactly once:
+// retransmitted SYNs aren't counted again, and only the first FIN/RST from
+// either side decrements. Plain HASH, not LRU: when full, new connections go
+// uncounted rather than live ones being evicted without a decrement.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct conn_key);
+    __type(value, struct conn_info);
+    __uint(max_entries, 131072);
+} conn_track_map SEC(".maps");
+
 // --- Helper functions ---
 
 static __always_inline void inc_stats(__u32 key)
@@ -143,6 +170,19 @@ static __always_inline int check_syn_rate(__u32 src_ip, __u32 rate_limit)
     }
 
     return 0; // rate exceeded
+}
+
+// Stop tracking a closed connection and decrement its client's count. Only
+// the first FIN/RST seen (from either side) still finds the entry, so each
+// connection is decremented exactly once.
+static __always_inline void conn_closed(struct conn_key *key)
+{
+    if (bpf_map_delete_elem(&conn_track_map, key) != 0)
+        return;
+
+    __u64 *conn_count = bpf_map_lookup_elem(&conn_count_map, &key->client_ip);
+    if (conn_count && *conn_count > 0)
+        __sync_fetch_and_add(conn_count, -1);
 }
 
 // --- Main XDP program ---
@@ -225,6 +265,14 @@ int xdp_ratelimit(struct xdp_md *ctx)
     if (!cfg)
         goto pass; // No config = pass everything
 
+    struct conn_key ck = {
+        .client_ip = src_ip,
+        .server_ip = ip->daddr,
+        .client_port = tcp->source,
+        .server_port = tcp->dest,
+    };
+    __u64 now = bpf_ktime_get_ns();
+
     // --- SYN packet handling ---
     if (tcp->syn && !tcp->ack) {
         // Check SYN rate (token bucket)
@@ -237,6 +285,13 @@ int xdp_ratelimit(struct xdp_md *ctx)
             __u32 stats_syn = STATS_DROPPED_SYN_RATE;
             inc_stats(stats_syn);
             return XDP_DROP;
+        }
+
+        // A retransmitted SYN for a connection already counted only refreshes it
+        struct conn_info *ci = bpf_map_lookup_elem(&conn_track_map, &ck);
+        if (ci) {
+            ci->last_seen_ns = now;
+            goto pass;
         }
 
         // Check connection count limit
@@ -252,22 +307,29 @@ int xdp_ratelimit(struct xdp_md *ctx)
             return XDP_DROP;
         }
 
-        // Increment connection count
-        if (conn_count) {
-            __sync_fetch_and_add(conn_count, 1);
-        } else {
-            __u64 one = 1;
-            bpf_map_update_elem(&conn_count_map, &src_ip, &one, BPF_ANY);
+        // Track and count the new connection (left uncounted if the table is full)
+        struct conn_info new_ci = { .last_seen_ns = now };
+        if (bpf_map_update_elem(&conn_track_map, &ck, &new_ci, BPF_NOEXIST) == 0) {
+            if (conn_count) {
+                __sync_fetch_and_add(conn_count, 1);
+            } else {
+                __u64 one = 1;
+                bpf_map_update_elem(&conn_count_map, &src_ip, &one, BPF_ANY);
+            }
         }
+        goto pass;
     }
 
-    // --- RST/FIN: decrement connection counter ---
+    // --- RST/FIN from the client: connection closed ---
     if (tcp->rst || tcp->fin) {
-        __u64 *conn_count = bpf_map_lookup_elem(&conn_count_map, &src_ip);
-        if (conn_count && *conn_count > 0) {
-            __sync_fetch_and_add(conn_count, -1);
-        }
+        conn_closed(&ck);
+        goto pass;
     }
+
+    // --- Any other packet keeps the connection's idle timer fresh ---
+    struct conn_info *ci = bpf_map_lookup_elem(&conn_track_map, &ck);
+    if (ci)
+        ci->last_seen_ns = now;
 
 pass:
     inc_stats(stats_pass);
@@ -275,8 +337,9 @@ pass:
 }
 
 // --- TC egress program ---
-// Captures outbound FIN/RST to decrement conn_count_map
-// (XDP only sees inbound packets, so outbound FIN/RST from server is invisible)
+// Captures outbound FIN/RST so server-initiated closes are counted down right
+// away (XDP only sees inbound packets). Needs TCX (Linux 6.6+); without it,
+// connections the client never FINs/RSTs are dropped by the idle cleanup.
 
 SEC("tc")
 int tc_egress_track(struct __sk_buff *skb)
@@ -313,12 +376,14 @@ int tc_egress_track(struct __sk_buff *skb)
         return 0;
 
     if (tcp->rst || tcp->fin) {
-        // Destination IP = the remote client (was src_ip in XDP ingress)
-        __u32 dst_ip = ip->daddr;
-        __u64 *conn_count = bpf_map_lookup_elem(&conn_count_map, &dst_ip);
-        if (conn_count && *conn_count > 0) {
-            __sync_fetch_and_add(conn_count, -1);
-        }
+        // Same key as on ingress: the remote client is the destination here
+        struct conn_key ck = {
+            .client_ip = ip->daddr,
+            .server_ip = ip->saddr,
+            .client_port = tcp->dest,
+            .server_port = tcp->source,
+        };
+        conn_closed(&ck);
     }
 
     return 0; // TC_ACT_OK - never drop outbound packets

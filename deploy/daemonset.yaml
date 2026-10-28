@@ -57,6 +57,8 @@ spec:
               value: "200"
             - name: XDP_BLACKLIST_DURATION
               value: "600"
+            - name: XDP_CONN_IDLE_TIMEOUT
+              value: "300"
             # With hostNetwork + NodePort, set these to the NodePorts of your
             # ingress Service, not the load balancer's external ports.
             - name: XDP_TARGET_PORTS

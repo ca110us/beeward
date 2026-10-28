@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -23,14 +24,21 @@ func (rl *RateLimiter) blacklistCleaner(ctx context.Context) {
 	}
 }
 
-func (rl *RateLimiter) cleanBlacklist() {
-	// Get current monotonic time (same clock as bpf_ktime_get_ns)
+// monotonicNowNs returns the current time on the same clock as bpf_ktime_get_ns
+func monotonicNowNs() (uint64, bool) {
 	var ts unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
 		log.Printf("[XDP] WARNING: ClockGettime failed: %v", err)
+		return 0, false
+	}
+	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec), true
+}
+
+func (rl *RateLimiter) cleanBlacklist() {
+	nowNs, ok := monotonicNowNs()
+	if !ok {
 		return
 	}
-	nowNs := uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
 
 	var key uint32
 	var expiry uint64
@@ -56,8 +64,9 @@ func (rl *RateLimiter) cleanBlacklist() {
 	}
 }
 
-// connCountCleaner periodically removes zero-count entries from conn_count_map.
-// Actual count maintenance is handled in kernel by XDP (ingress) + TC (egress).
+// connCountCleaner periodically drops idle tracked connections and removes
+// zero-count entries from conn_count_map. Counting itself happens in kernel:
+// XDP on SYN and client FIN/RST, TC egress on server FIN/RST.
 func (rl *RateLimiter) connCountCleaner(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -67,8 +76,49 @@ func (rl *RateLimiter) connCountCleaner(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			rl.cleanConnTrack()
 			rl.cleanConnCount()
 		}
+	}
+}
+
+// cleanConnTrack stops counting connections with no client packets for
+// ConnIdleTimeout: ones that ended without a FIN/RST we could see (client
+// vanished, or closed by the server on kernels without TC egress).
+func (rl *RateLimiter) cleanConnTrack() {
+	nowNs, ok := monotonicNowNs()
+	if !ok {
+		return
+	}
+	idleNs := uint64(rl.cfg.ConnIdleTimeout) * 1_000_000_000
+
+	var (
+		key   xdp_ratelimitConnKey
+		info  xdp_ratelimitConnInfo
+		stale []xdp_ratelimitConnKey
+	)
+	iter := rl.objs.ConnTrackMap.Iterate()
+	for iter.Next(&key, &info) {
+		if nowNs > info.LastSeenNs && nowNs-info.LastSeenNs > idleNs {
+			stale = append(stale, key)
+		}
+	}
+
+	removed := 0
+	for _, k := range stale {
+		// Only decrement if we removed it, not a FIN/RST that raced us in BPF
+		if err := rl.objs.ConnTrackMap.Delete(&k); err != nil {
+			continue
+		}
+		removed++
+		// Not atomic with BPF increments; a race can only undercount (fail open)
+		var count uint64
+		if rl.objs.ConnCountMap.Lookup(&k.ClientIp, &count) == nil && count > 0 {
+			rl.objs.ConnCountMap.Update(&k.ClientIp, count-1, ebpf.UpdateExist)
+		}
+	}
+	if removed > 0 {
+		log.Printf("[XDP] Stopped counting %d idle connections", removed)
 	}
 }
 
