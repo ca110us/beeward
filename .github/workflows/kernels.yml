@@ -1,0 +1,95 @@
+name: Kernels
+
+# Runs the NFS workload against Beeward on a range of kernels in LVH VMs,
+# with pods emulated by Kubernetes-style cgroups (see test/vm/run-in-vm.sh).
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PODS: writer-a=11111111-1111-1111-1111-111111111111,writer-b=22222222-2222-2222-2222-222222222222,reader-c=33333333-3333-3333-3333-333333333333
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build binary
+        run: |
+          docker build -t beeward:ci .
+          docker cp "$(docker create beeward:ci)":/usr/local/bin/beeward ./beeward
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: beeward
+          path: beeward
+
+  test:
+    needs: build
+    name: Kernel ${{ matrix.kernel }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 5.10 is the minimum supported kernel (5.4 lacks bpf_link for XDP
+        # and uses a different cgroup ID format)
+        kernel:
+          - 5.10-20261021.083220
+          - 5.15-20261021.083220
+          - 6.1-20261021.083220
+          - 6.6-20261021.083220
+          - 6.12-20261021.083220
+          - 6.18-20261021.083220
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: beeward
+
+      - run: chmod +x beeward
+
+      - uses: ./.github/actions/nfs-server
+
+      - name: Start VM, Beeward and workload
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          test-name: beeward
+          image: kind
+          image-version: ${{ matrix.kernel }}
+          mem: 4G
+          cpu: 2
+          cpu-kind: ''
+          install-dependencies: true
+          host-mount: ./
+          port-forward: '9100:9100'
+          cmd: bash /host/test/vm/run-in-vm.sh ${{ env.NFS_SERVER }}
+
+      - name: Check per-pod metrics
+        run: python3 test/e2e/check.py --pods "$PODS"
+
+      - name: Check probes attached
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          provision: 'false'
+          cmd: |
+            cat /tmp/beeward.log
+            grep -q "Attached to NFS read function" /tmp/beeward.log
+            grep -q "Attached to NFS write function" /tmp/beeward.log
+            grep -q "\[XDP\] Rate limiter active" /tmp/beeward.log
+
+      - name: Dump state on failure
+        if: failure()
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          provision: 'false'
+          cmd: |
+            cat /tmp/beeward.log /tmp/workload.log || true
+            mount | grep nfs || true
+            curl -s http://127.0.0.1:9100/metrics | grep -E '^(nfs|xdp)_' || true

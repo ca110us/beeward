@@ -134,7 +134,8 @@ bpftool map dump pinned /sys/fs/bpf/xdp_ratelimit/blacklist_map
 
 ## Requirements
 
-- Linux kernel with eBPF, kprobe and XDP support (5.x recommended)
+- Linux 5.10 or newer, cgroup v2. CI tests 5.10, 5.15, 6.1, 6.6, 6.12, 6.18 and 7.0
+- The XDP rate limiter's connection limit needs Linux 6.6+ to track closed connections (TCX); on older kernels the per-IP connection count only grows
 - NFS client functions present in the kernel (`grep nfs_file /proc/kallsyms`) for the NFS module
 - Pod privileges: `privileged: true`, `hostPID: true`, `hostNetwork: true`
 - Host mounts: `/sys/kernel/debug` (kprobes) and `/sys/fs/bpf` (map pinning)

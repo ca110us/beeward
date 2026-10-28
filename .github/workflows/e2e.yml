@@ -20,17 +20,7 @@ jobs:
       - name: Build image
         run: docker build -t beeward:e2e .
 
-      - name: Start NFS server
-        run: |
-          echo "Kernel: $(uname -r)"
-          sudo apt-get update -q
-          sudo apt-get install -y -q nfs-kernel-server nfs-common
-          sudo mkdir -p /srv/nfs
-          sudo chmod 777 /srv/nfs
-          echo '/srv/nfs *(rw,sync,no_subtree_check,no_root_squash,insecure)' | sudo tee /etc/exports
-          sudo exportfs -ra
-          sudo systemctl restart nfs-server
-          echo "NFS_SERVER=$(hostname -I | awk '{print $1}')" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/nfs-server
 
       - name: Start k3s
         run: |
